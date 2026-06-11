@@ -1,0 +1,28 @@
+{
+  "description": "session-ledger: cross-session in-progress change tracking for the working directory",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/session-ledger/hook.mjs\" session-start",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/session-ledger/hook.mjs\" pre-write",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
