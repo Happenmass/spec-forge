@@ -100,7 +100,7 @@ function startTask(args, ctx) {
 
   const sessions = core.buildState(core.readEventsBySession(ctx.ledgerDir));
   const bindings = core.readBindings(ctx.ledgerDir);
-  const dirty = core.gitDirtyFiles(ctx.projectRoot);
+  const dirty = core.gitDirtyFiles(ctx.projectRoot, ctx.repos);
 
   const lines = [
     `Task recorded for session ${core.shortSid(ctx.sessionId)}: "${goal}"`,
@@ -108,7 +108,7 @@ function startTask(args, ctx) {
   let anyConflict = false;
   for (const f of planned) {
     const conflicts = core.conflictsForFile(
-      { sessions, bindings, dirty, mySessionId: ctx.sessionId },
+      { sessions, bindings, dirty, repos: ctx.repos, mySessionId: ctx.sessionId },
       f
     );
     for (const c of conflicts) {
@@ -178,11 +178,12 @@ function whoChanged(args, ctx) {
 
   const sessions = core.buildState(core.readEventsBySession(ctx.ledgerDir));
   const bindings = core.readBindings(ctx.ledgerDir);
-  const dirty = core.gitDirtyFiles(ctx.projectRoot);
-  const lastCommit = core.gitLastCommit(ctx.projectRoot, rel);
+  const dirty = core.gitDirtyFiles(ctx.projectRoot, ctx.repos);
+  const lastCommit = core.gitLastCommit(ctx.projectRoot, rel, ctx.repos);
 
   const lines = [`File: ${rel}`];
-  if (dirty !== null) lines.push(`Git: ${dirty.has(rel) ? 'HAS uncommitted changes' : 'clean (no uncommitted changes)'}`);
+  const dirtiness = core.fileDirtiness(dirty, ctx.repos, rel);
+  if (dirtiness !== null) lines.push(`Git: ${dirtiness ? 'HAS uncommitted changes' : 'clean (no uncommitted changes)'}`);
   if (lastCommit) lines.push(`Last commit touching it: ${lastCommit.sha} "${lastCommit.subject}" (${core.ago(lastCommit.ts)})`);
 
   const records = [];
@@ -197,7 +198,7 @@ function whoChanged(args, ctx) {
   }
   lines.push('', 'In-progress edit records:');
   lines.push(...(records.length ? records : ['(none)']));
-  if (!records.length && dirty !== null && dirty.has(rel)) {
+  if (!records.length && dirtiness === true) {
     lines.push(
       'NOTE: the file is dirty but no tracked session recorded an edit — likely a manual edit, another tool, or a session without this plugin. It is probably NOT yours.'
     );
@@ -221,7 +222,12 @@ function callTool(params) {
   const args = params?.arguments || {};
   const { projectRoot, ledgerDir } = core.loadContext(projectCwd());
   core.reconcile(ledgerDir, projectRoot);
-  const ctx = { projectRoot, ledgerDir, sessionId: mySessionId(ledgerDir) };
+  const ctx = {
+    projectRoot,
+    ledgerDir,
+    repos: core.workspaceRepos(projectRoot),
+    sessionId: mySessionId(ledgerDir),
+  };
 
   let text;
   if (name === 'start_task') text = startTask(args, ctx);

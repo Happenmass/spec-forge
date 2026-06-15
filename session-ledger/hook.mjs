@@ -14,10 +14,21 @@ import * as core from './core.mjs';
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 const MAX_LISTED = 15;
 
+// Stable session root for resolving the ledger shard. The hook payload's `cwd`
+// drifts when the session runs `cd` in Bash — keying the shard off it would
+// scatter records across shards the MCP server (keyed off the session start
+// directory) never reads. CLAUDE_PROJECT_DIR is injected by Claude Code into
+// every hook process; guard against an unexpanded "${CLAUDE_PROJECT_DIR}".
+function stableProjectCwd(input) {
+  const env = process.env.CLAUDE_PROJECT_DIR;
+  if (env && !env.startsWith('$')) return env;
+  return input.cwd || process.cwd();
+}
+
 function onSessionStart(input) {
   const sessionId = input.session_id;
   if (!sessionId) return null;
-  const { projectRoot, ledgerDir } = core.loadContext(input.cwd);
+  const { projectRoot, ledgerDir } = core.loadContext(stableProjectCwd(input));
   core.writeBinding(ledgerDir, sessionId);
   core.reconcile(ledgerDir, projectRoot);
 
@@ -47,8 +58,10 @@ function onPreWrite(input) {
   const target = ti.file_path || ti.notebook_path;
   if (!target || typeof target !== 'string') return null;
 
+  // Relative tool paths resolve against the live cwd; the ledger shard and
+  // project-relative keys resolve against the stable session root.
   const cwd = input.cwd || process.cwd();
-  const { projectRoot, ledgerDir } = core.loadContext(cwd);
+  const { projectRoot, ledgerDir } = core.loadContext(stableProjectCwd(input));
   const rel = path.relative(projectRoot, core.safeRealpath(path.resolve(cwd, target)));
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null; // outside this project — not tracked
 
@@ -57,12 +70,13 @@ function onPreWrite(input) {
 
   const sessions = core.buildState(core.readEventsBySession(ledgerDir));
   const bindings = core.readBindings(ledgerDir);
-  const dirty = core.gitDirtyFiles(projectRoot);
+  const repos = core.workspaceRepos(projectRoot);
+  const dirty = core.gitDirtyFiles(projectRoot, repos);
   const mine = sessions.get(sessionId);
 
-  const conflicts = core.conflictsForFile({ sessions, bindings, dirty, mySessionId: sessionId }, rel);
+  const conflicts = core.conflictsForFile({ sessions, bindings, dirty, repos, mySessionId: sessionId }, rel);
   const anyRecord = [...sessions.values()].some((s) => s.writes.has(rel));
-  const unannotated = dirty !== null && dirty.has(rel) && !anyRecord;
+  const unannotated = core.fileDirtiness(dirty, repos, rel) === true && !anyRecord;
 
   if ((conflicts.length || unannotated) && !mine?.warned.has(rel)) {
     core.appendEvent(ledgerDir, sessionId, { type: 'warned', file: rel });

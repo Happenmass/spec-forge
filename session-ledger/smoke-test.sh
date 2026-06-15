@@ -20,12 +20,15 @@ check_empty() { # name actual
   else FAIL=$((FAIL+1)); echo "FAIL - $1 (expected empty output)"; echo "       actual: ${2:0:400}"; fi
 }
 
-hook() { # mode json
-  echo "$2" | node "$DIR/hook.mjs" "$1"
+hook() { # mode json [project_dir]
+  # CLAUDE_PROJECT_DIR is set explicitly: the hook prefers it over the payload
+  # cwd, and the ambient value (when this test runs inside a Claude session)
+  # must not leak in.
+  echo "$2" | CLAUDE_PROJECT_DIR="${3:-$REPO}" node "$DIR/hook.mjs" "$1"
 }
-run_mcp() { # session_id, then one JSON-RPC line per arg
+run_mcp() { # session_id, then one JSON-RPC line per arg (project dir: $MCP_DIR, default $REPO)
   local sid="$1"; shift
-  printf '%s\n' "$@" | SESSION_LEDGER_SESSION_ID="$sid" SESSION_LEDGER_PROJECT_DIR="$REPO" node "$DIR/server.mjs"
+  printf '%s\n' "$@" | SESSION_LEDGER_SESSION_ID="$sid" SESSION_LEDGER_PROJECT_DIR="${MCP_DIR:-$REPO}" node "$DIR/server.mjs"
 }
 
 mkdir -p "$REPO"; cd "$REPO"
@@ -102,6 +105,50 @@ OUT=$(run_mcp sessA "$INIT" "$INITED" "$CALL_TASK")
 check "start_task records the goal" 'Task recorded' "$OUT"
 check "start_task flags the planned-file conflict" 'CONFLICT' "$OUT"
 check "conflict names sessB" 'session sessB' "$OUT"
+
+echo "== multi-repo workspace (parent dir not a git repo) =="
+
+WS="$WORK/workspace"
+mkdir -p "$WS/repoA" "$WS/repoB"
+for r in repoA repoB; do
+  cd "$WS/$r"
+  git init -q; git config user.email test@test; git config user.name test
+  echo base > f.txt; git add .; git commit -qm init
+done
+cd "$WS"
+
+# In-session `cd` drifted the cwd into repoA; the session edits a file in repoB.
+# The stable CLAUDE_PROJECT_DIR must key the shard, not the drifted cwd.
+OUT=$(hook pre-write "{\"session_id\":\"sessW\",\"cwd\":\"$WS/repoA\",\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$WS/repoB/f.txt\"}}" "$WS")
+check_empty "cross-sub-repo first edit is allowed silently" "$OUT"
+echo change-by-W >> "$WS/repoB/f.txt"
+
+WS_SHARD=$(ls -d "$SESSION_LEDGER_HOME"/workspace-* 2>/dev/null | head -1)
+if [[ -n "$WS_SHARD" && -f "$WS_SHARD/sessions/sessW.jsonl" ]]; then
+  PASS=$((PASS+1)); echo "ok   - edit recorded in the workspace shard (not a sub-repo shard)"
+else
+  FAIL=$((FAIL+1)); echo "FAIL - edit recorded in the workspace shard (not a sub-repo shard)"
+fi
+check "edit keyed relative to the workspace root" 'repoB/f.txt' "$(cat "$WS_SHARD/sessions/sessW.jsonl" 2>/dev/null)"
+
+# A recorded edit directly in the parent dir (covered by no repo) must survive
+# reconciliation — git cannot prove it clean.
+OUT=$(hook pre-write "{\"session_id\":\"sessW\",\"cwd\":\"$WS\",\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$WS/notes.md\"}}" "$WS")
+echo notes > "$WS/notes.md"
+
+CALL_WHO_WS='{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"who_changed","arguments":{"file":"repoB/f.txt"}}}'
+MCP_DIR="$WS"
+OUT=$(run_mcp sessV "$INIT" "$INITED" "$CALL_WHO_WS")
+check "who_changed (workspace shard) finds the cross-sub-repo edit" 'session sessW' "$OUT"
+check "who_changed sees sub-repo dirtiness" 'HAS uncommitted changes' "$OUT"
+
+(cd "$WS/repoB" && git add -A && git commit -qm "feat: ship f in repoB")
+
+OUT=$(run_mcp sessV "$INIT" "$INITED" "$CALL_LIST")
+check "multi-repo reconcile archives the committed sub-repo file" 'feat: ship f in repoB' "$OUT"
+check "archived entry marked committed" '→ committed' "$OUT"
+check "uncovered parent-dir file stays in progress" 'notes.md' "$OUT"
+unset MCP_DIR
 
 echo "== session binding resolution =="
 

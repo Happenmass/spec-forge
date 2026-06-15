@@ -2,7 +2,7 @@
   "name": "spec-forge",
   "displayName": "Spec Forge",
   "description": "Spec → plan → execute pipeline for coding agents. Turns requirements into implementable, RFC 2119-normative specifications (full-spec / quick-spec), then into bite-sized TDD implementation plans (writing-plans) and runs them with review checkpoints (executing-plans). Ships session-ledger: a cross-session in-progress change ledger (MCP + hooks) that de-confuses multiple Claude Code sessions sharing one working directory.",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": {
     "name": "guhappen",
     "email": "toma71136@gmail.com"

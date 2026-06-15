@@ -53,10 +53,23 @@ their respective `claude` processes, so the match is unambiguous. Override with
 └── archive.jsonl          # reconciled entries with commit traceback
 ```
 
-The ledger is indexed by **git toplevel** (fallback: cwd), so sessions started
-in different subdirectories of one repo share a ledger. Paths are stored
-relative to the root; `/tmp` vs `/private/tmp`-style symlink spellings are
-canonicalized (`safeRealpath`).
+The ledger is indexed by the **stable session root**: hooks use
+`CLAUDE_PROJECT_DIR` (falling back to the payload cwd) and the MCP server uses
+`SESSION_LEDGER_PROJECT_DIR`, both normalized to the git toplevel when inside a
+repo. The hook payload's `cwd` is deliberately **not** used for indexing — it
+drifts when the session runs `cd` in Bash, which would scatter records across
+shards the server never reads. Paths are stored relative to the root; `/tmp` vs
+`/private/tmp`-style symlink spellings are canonicalized (`safeRealpath`).
+
+### Multi-repo workspaces
+
+When the session root is **not itself a git repo** but contains git repos as
+immediate children (e.g. `~/code/workspace/{repoA,repoB}`), the ledger treats
+them as one workspace: edits anywhere under the root are recorded relative to
+it (including cross-sub-repo edits while the cwd sits in a sibling repo), and
+reconciliation runs `git status` per sub-repo, archiving entries only when the
+**covering** repo proves them clean. Files covered by no repo (directly in the
+parent dir) are kept — git cannot prove them clean.
 
 ## Environment overrides
 
@@ -64,6 +77,7 @@ canonicalized (`safeRealpath`).
 | --- | --- | --- |
 | `SESSION_LEDGER_HOME` | Ledger storage root | `~/.claude/session-ledger` |
 | `SESSION_LEDGER_PROJECT_DIR` | Working directory the MCP server indexes (set to `${CLAUDE_PROJECT_DIR}` by the plugin's `.mcp.json`) | server `cwd` |
+| `CLAUDE_PROJECT_DIR` | Stable session root the hooks index (injected by Claude Code into hook processes) | hook payload `cwd` |
 | `SESSION_LEDGER_SESSION_ID` | Bypass PID-chain resolution and use this session id (used by the smoke test) | resolved via bindings |
 | `SESSION_LEDGER_DEBUG` | Append diagnostics to `<ledger>/debug.log` | off |
 
@@ -84,3 +98,8 @@ canonicalized (`safeRealpath`).
   unannotated later and re-warns once.
 - Liveness detection is heuristic (anchor PID + command name); when unknown it
   is reported as "liveness unknown" rather than guessed.
+- Multi-repo workspace discovery only looks at **immediate children** of the
+  session root, and bails out (back to no-git behavior: records kept, never
+  reconciled) above 16 sub-repos to keep per-write `git status` cost bounded.
+- In a multi-repo workspace, recorded edits to files covered by **no** sub-repo
+  stay in-progress until manually superseded — there is no git to clear them.

@@ -154,27 +154,81 @@ export function buildState(eventsBySession) {
 }
 
 // ---------------------------------------------------------------------------
-// Git helpers
+// Git helpers — workspace-aware. A "workspace" is projectRoot plus the git
+// repos covering it: projectRoot itself when it is a repo, otherwise its
+// immediate child repos (multi-repo workspace, e.g. ~/code/ws/{repoA,repoB}).
 // ---------------------------------------------------------------------------
 
-// Set of dirty paths relative to projectRoot, or null when not a git repo.
-export function gitDirtyFiles(projectRoot) {
-  const out = sh('git', ['status', '--porcelain', '-uall', '-z'], { cwd: projectRoot });
-  if (out === null) return null;
+const MAX_WORKSPACE_REPOS = 16;
+
+// [{dir, prefix}] — prefix is '' when projectRoot is the repo, 'child/' for
+// sub-repos. Empty array → no git coverage at all (plain directory), or more
+// sub-repos than we are willing to `git status` on every write (fail open to
+// the no-git behavior: records kept, never reconciled).
+export function workspaceRepos(projectRoot) {
+  try {
+    if (fs.existsSync(path.join(projectRoot, '.git'))) return [{ dir: projectRoot, prefix: '' }];
+  } catch {
+    return [];
+  }
+  const repos = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(projectRoot, { withFileTypes: true });
+  } catch {}
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name.startsWith('.')) continue;
+    try {
+      if (!fs.existsSync(path.join(projectRoot, e.name, '.git'))) continue;
+    } catch {
+      continue;
+    }
+    repos.push({ dir: path.join(projectRoot, e.name), prefix: `${e.name}/` });
+    if (repos.length > MAX_WORKSPACE_REPOS) return [];
+  }
+  return repos;
+}
+
+// The repo whose subtree contains relFile, or null (file covered by no repo).
+export function repoFor(repos, relFile) {
+  for (const r of repos) if (!r.prefix || relFile.startsWith(r.prefix)) return r;
+  return null;
+}
+
+// true (has uncommitted changes) / false (provably clean) / null (unknown —
+// no git, a status failure, or the file sits outside every covering repo).
+// Only `false` may archive an entry; `null` must keep it.
+export function fileDirtiness(dirty, repos, relFile) {
+  if (dirty === null) return null;
+  if (dirty.has(relFile)) return true;
+  return repoFor(repos, relFile) ? false : null;
+}
+
+// Set of dirty paths relative to projectRoot (union across covering repos),
+// or null when nothing is covered or any repo's status failed — partial
+// knowledge could falsely archive entries, so it degrades to "unknown".
+export function gitDirtyFiles(projectRoot, repos = workspaceRepos(projectRoot)) {
+  if (!repos.length) return null;
   const files = new Set();
-  const parts = out.split('\0');
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
-    if (p.length < 4) continue;
-    files.add(p.slice(3));
-    if (p[0] === 'R' || p[0] === 'C') i++; // skip the "orig -> " companion record
+  for (const r of repos) {
+    const out = sh('git', ['status', '--porcelain', '-uall', '-z'], { cwd: r.dir });
+    if (out === null) return null;
+    const parts = out.split('\0');
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (p.length < 4) continue;
+      files.add(r.prefix + p.slice(3));
+      if (p[0] === 'R' || p[0] === 'C') i++; // skip the "orig -> " companion record
+    }
   }
   return files;
 }
 
-export function gitLastCommit(projectRoot, relFile) {
-  const out = sh('git', ['log', '-1', '--format=%h%x00%ct%x00%s', '--', relFile], {
-    cwd: projectRoot,
+export function gitLastCommit(projectRoot, relFile, repos = workspaceRepos(projectRoot)) {
+  const repo = repoFor(repos, relFile);
+  if (!repo) return null;
+  const out = sh('git', ['log', '-1', '--format=%h%x00%ct%x00%s', '--', relFile.slice(repo.prefix.length)], {
+    cwd: repo.dir,
   });
   if (!out || !out.trim()) return null;
   const [sha, ct, subject] = out.trim().split('\0');
@@ -187,7 +241,8 @@ export function gitLastCommit(projectRoot, relFile) {
 // ---------------------------------------------------------------------------
 
 export function reconcile(ledgerDir, projectRoot) {
-  const dirty = gitDirtyFiles(projectRoot);
+  const repos = workspaceRepos(projectRoot);
+  const dirty = gitDirtyFiles(projectRoot, repos);
   if (dirty === null) return; // no git — nothing to reconcile against
 
   const lock = path.join(ledgerDir, '.reconcile.lock');
@@ -209,7 +264,11 @@ export function reconcile(ledgerDir, projectRoot) {
       const events = parseJsonl(fs.readFileSync(full, 'utf8'));
       const cleanFiles = new Set();
       for (const e of events) {
-        if ((e.type === 'write' || e.type === 'warned') && e.file && !dirty.has(e.file)) {
+        if (
+          (e.type === 'write' || e.type === 'warned') &&
+          e.file &&
+          fileDirtiness(dirty, repos, e.file) === false
+        ) {
           cleanFiles.add(e.file);
         }
       }
@@ -220,7 +279,7 @@ export function reconcile(ledgerDir, projectRoot) {
       for (const file of cleanFiles) {
         const w = state.writes.get(file);
         if (!w) continue; // warned-only marker: drop silently so future conflicts re-warn
-        const commit = gitLastCommit(projectRoot, file);
+        const commit = gitLastCommit(projectRoot, file, repos);
         const committed = commit && commit.ts >= w.lastTs - 60_000;
         archived.push({
           ts: Date.now(),
@@ -361,14 +420,15 @@ export function bindingAlive(b) {
 // ---------------------------------------------------------------------------
 
 // Other sessions with a claim on relFile. A write-claim counts while the file
-// is still dirty; a planned-claim counts while the claiming session is alive.
-export function conflictsForFile({ sessions, bindings, dirty, mySessionId }, relFile) {
+// is still dirty (or its dirtiness is unknown); a planned-claim counts while
+// the claiming session is alive.
+export function conflictsForFile({ sessions, bindings, dirty, repos = [], mySessionId }, relFile) {
   const out = [];
   for (const [sid, s] of sessions) {
     if (sid === mySessionId) continue;
     const alive = bindingAlive(bindings.get(sid));
     const w = s.writes.get(relFile);
-    if (w && (dirty === null || dirty.has(relFile))) {
+    if (w && fileDirtiness(dirty, repos, relFile) !== false) {
       out.push({ session: sid, kind: 'editing', goal: w.goal, lastTs: w.lastTs, alive });
       continue;
     }
@@ -380,7 +440,8 @@ export function conflictsForFile({ sessions, bindings, dirty, mySessionId }, rel
 }
 
 export function overview(ledgerDir, projectRoot, mySessionId = null) {
-  const dirty = gitDirtyFiles(projectRoot);
+  const repos = workspaceRepos(projectRoot);
+  const dirty = gitDirtyFiles(projectRoot, repos);
   const sessions = buildState(readEventsBySession(ledgerDir));
   const bindings = readBindings(ledgerDir);
 
@@ -388,7 +449,7 @@ export function overview(ledgerDir, projectRoot, mySessionId = null) {
   const recorded = new Set();
   for (const [sid, s] of sessions) {
     const files = [...s.writes.entries()]
-      .filter(([f]) => dirty === null || dirty.has(f))
+      .filter(([f]) => fileDirtiness(dirty, repos, f) !== false)
       .map(([f, w]) => ({ file: f, lastTs: w.lastTs, count: w.count, goal: w.goal }))
       .sort((a, b) => b.lastTs - a.lastTs);
     for (const f of files) recorded.add(f.file);
